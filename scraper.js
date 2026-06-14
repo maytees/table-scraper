@@ -150,6 +150,7 @@
       if (S.scrolling) return;
       detailLoop('retry');
     } });
+    U.cDelay = h('input', { class: 't', type: 'number', value: '250', min: '0', title: 'Pause between listing clicks (ms). Lower = faster. Separate from the scroll delay.' });
     U.barFill = h('i');
     U.bar = h('div', { class: 'bar' }, U.barFill);
     U.btnCsv = h('button', { class: 'b primary', text: '⬇ Export CSV', onclick: exportCsv });
@@ -182,7 +183,8 @@
         h('div', { class: 'row' }, U.btnPick),
         U.fieldsBox,
         U.nameForm,
-        h('div', { class: 'row' }, U.btnDetails, U.btnRetry),
+        h('div', { class: 'row' }, U.btnDetails, U.btnRetry,
+          h('label', { class: 'muted' }, 'click delay ', U.cDelay, ' ms')),
         U.bar),
       h('section', {},
         h('div', { class: 'step' }, h('span', { class: 'n', text: '3' }), 'Export'),
@@ -229,6 +231,13 @@
     let hi = parseInt(U.dMax.value, 10); if (isNaN(hi)) hi = 2200;
     if (hi < lo) [lo, hi] = [hi, lo];
     return { lo: Math.max(0, lo), hi: Math.max(0, hi) };
+  }
+
+  // small pause between detail clicks (separate from the scroll delay); slight jitter for politeness
+  function clickDelay() {
+    let d = parseInt(U.cDelay.value, 10); if (isNaN(d)) d = 250;
+    d = Math.max(0, d);
+    return d + Math.round(Math.random() * d * 0.3);
   }
 
   // ---------- list detection (IDS-style: repeating sibling structures, not just <table>) ----------
@@ -634,20 +643,38 @@
     }
   }
 
-  async function grabField(f, prev, extraMs) {
-    // wait until the matched element is a NEW node (panel re-rendered) or its value changed,
-    // so we never read the previous listing's stale value
-    const deadline = Date.now() + extraMs;
+  // Maps changes location.href when a listing is opened — that's the fast, reliable
+  // "panel switched" signal. Also accept any taught field becoming a new node.
+  async function waitPanelSwitch(prevUrl, prev, ms) {
+    const deadline = Date.now() + ms;
     while (S.detailing && Date.now() < deadline) {
-      const el = queryField(f);
-      if (el && (el !== prev.el || valueOf(el) !== prev.val)) {
-        const v = valueOf(el);
-        if (v) return v;
+      if (location.href !== prevUrl) return true;
+      for (let i = 0; i < S.fields.length; i++) {
+        const el = queryField(S.fields[i]);
+        if (el && el !== prev[i].el) return true;
       }
-      await sleep(250);
+      await sleep(70);
     }
-    const el = queryField(f);
-    return el && (el !== prev.el || valueOf(el) !== prev.val) ? valueOf(el) : '';
+    return location.href !== prevUrl;
+  }
+
+  // Grab all fields together in one poll loop. Returns as soon as every field is found,
+  // so a value-less listing waits once (maxMs) instead of 5s PER field.
+  async function grabAll(prev, switched, maxMs) {
+    const out = new Array(S.fields.length).fill('');
+    const need = new Set(S.fields.map((_, i) => i));
+    const deadline = Date.now() + maxMs;
+    while (S.detailing && need.size && Date.now() < deadline) {
+      for (const i of [...need]) {
+        const el = queryField(S.fields[i]);
+        if (!el) continue;
+        const v = valueOf(el);
+        // panel already switched => any present value is the new listing's; else guard against stale
+        if (v && (switched || el !== prev[i].el || v !== prev[i].val)) { out[i] = v; need.delete(i); }
+      }
+      if (need.size) await sleep(90);
+    }
+    return out;
   }
 
   async function detailLoop(mode) {
@@ -685,17 +712,20 @@
       if (!rowEl || !row) { skipped++; continue; }
       try { rowEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
       hlRow(rowEl);
+      const prevUrl = location.href;
       const prev = S.fields.map((f) => {
         const el = queryField(f);
         return { el, val: el ? valueOf(el) : '' };
       });
       simulateClick(rowEl.querySelector('a[href]') || rowEl);
-      const { lo, hi } = delays();
-      await sleep(rand(lo, hi));
+      // wait for the listing panel to actually switch (URL change) — event-driven, not a fixed sleep
+      const switched = await waitPanelSwitch(prevUrl, prev, 3500);
+      await sleep(clickDelay()); // small settle + politeness pause
+      // switched => trust values fast (≤1.2s for a blank); fallback keeps the stale-guard a bit longer
+      const vals = await grabAll(prev, switched, switched ? 1200 : 3000);
       for (let i = 0; i < S.fields.length; i++) {
-        const v = await grabField(S.fields[i], prev[i], 5000);
-        row.details[S.fields[i].name] = v;
-        if (v) captured++; else missing++;
+        row.details[S.fields[i].name] = vals[i];
+        if (vals[i]) captured++; else missing++;
       }
       done++;
       U.barFill.style.width = Math.round((done / todoKeys.length) * 100) + '%';
