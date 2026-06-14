@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Table Scraper",
+  "version": "1.0.0",
+  "description": "Instant-Data-Scraper-style list scraper with a multi-step mode: auto-scrolls infinite lists, clicks each row, grabs detail fields (e.g. phone numbers) with random delays, exports CSV.",
+  "permissions": ["activeTab", "scripting"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Table Scraper — click to toggle panel" }
+}
