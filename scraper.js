@@ -756,11 +756,19 @@
         const el = queryField(f);
         return { el, val: el ? valueOf(el) : '' };
       });
-      dlive(`👆 ${pos}  ${nm} — clicking listing`);
-      simulateClick(rowEl.querySelector('a[href]') || rowEl);
-      // wait for the listing panel to actually switch (URL change) — event-driven, not a fixed sleep
-      dlive(`⏳ ${pos}  ${nm} — waiting for panel to open`);
-      const switched = await waitPanelSwitch(prevUrl, prev, 3500);
+      // click and wait for the panel to switch — RETRY the click up to 3× if it never opens
+      // (slow Google, a missed click, or the row re-rendered out from under us)
+      let switched = false, rEl = rowEl;
+      for (let att = 0; att < 3 && !switched && S.detailing; att++) {
+        if (att > 0) {
+          rEl = getRowEls().find((e) => rowKey(e) === key) || rEl; // re-find in case the list re-rendered
+          try { rEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
+        }
+        dlive(att === 0 ? `👆 ${pos}  ${nm} — clicking listing` : `⟳ ${pos}  ${nm} — panel didn't open, re-clicking (try ${att + 1}/3)`);
+        simulateClick(rEl.querySelector('a[href]') || rEl);
+        dlive(`⏳ ${pos}  ${nm} — waiting for panel to open${att ? ` (try ${att + 1})` : ''}`);
+        switched = await waitPanelSwitch(prevUrl, prev, 3500 + att * 1500); // give later tries longer
+      }
       await sleep(clickDelay()); // small settle + politeness pause
       // switched => trust values fast (≤1.2s for a blank); fallback keeps the stale-guard a bit longer
       dlive(`🔎 ${pos}  ${nm} — looking for: ${S.fields.map((f) => f.name).join(', ')}`);
