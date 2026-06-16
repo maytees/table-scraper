@@ -649,27 +649,55 @@
     }
   }
 
-  // Maps changes location.href when a listing is opened — that's the fast, reliable
-  // "panel switched" signal. Also accept any taught field becoming a new node.
-  async function waitPanelSwitch(prevUrl, prev, ms) {
-    const deadline = Date.now() + ms;
-    while (S.detailing && Date.now() < deadline) {
-      if (location.href !== prevUrl) return true;
-      for (let i = 0; i < S.fields.length; i++) {
-        const el = queryField(S.fields[i]);
-        if (el && el !== prev[i].el) return true;
-      }
-      await sleep(70);
-    }
-    return location.href !== prevUrl;
+  // ---- panel readiness by NAME (reliable: confirms the RIGHT listing loaded) ----
+
+  const alnum = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // the business name for a result row (full, from the link's aria-label)
+  function listingName(rowEl) {
+    const a = rowEl.querySelector('a[aria-label]');
+    let n = a ? a.getAttribute('aria-label') : '';
+    if (!n) n = norm(rowEl.textContent);
+    return norm(n.replace(/·.*$/, ''));
   }
 
-  // Grab all fields together in one poll loop. Returns as soon as every field is found,
-  // so a value-less listing waits once (maxMs) instead of 5s PER field.
-  // STALE-GUARD: only accept a value once the field clearly belongs to the NEW listing —
-  // a new DOM node OR a value different from the previous listing. This stops Google's
-  // slow repaint from handing us the previous listing's phone/website.
-  async function grabAll(prev, maxMs) {
+  // all candidate detail-panel titles currently on the page
+  function panelTitles() {
+    return [...document.querySelectorAll('div[role="main"] h1, h1.DUwDvf, h1')]
+      .map((h) => norm(h.textContent)).filter((t) => t && !/^results?$/i.test(t));
+  }
+
+  function nameMatches(name) {
+    const a = alnum(name);
+    if (a.length < 3) return false;
+    return panelTitles().some((t) => {
+      const b = alnum(t);
+      if (!b) return false;
+      const k = Math.min(16, Math.max(a.length, b.length));
+      return a === b || a.startsWith(b.slice(0, k)) || b.startsWith(a.slice(0, k));
+    });
+  }
+
+  // Resolve TRUE once the detail panel shows THIS listing (title matches + URL changed),
+  // detected via MutationObserver (instant) with a safety poll + timeout.
+  function waitForPanel(name, prevUrl, timeoutMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      const ready = () => location.href !== prevUrl && nameMatches(name);
+      const finish = (ok) => { if (done) return; done = true; obs.disconnect(); clearInterval(poll); clearTimeout(timer); resolve(ok); };
+      const check = () => { if (!done && (ready() || !S.detailing)) finish(ready()); };
+      const target = document.querySelector('div[role="main"]') || document.body;
+      const obs = new MutationObserver(check);
+      obs.observe(target, { childList: true, subtree: true, characterData: true });
+      const poll = setInterval(check, 150);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      check();
+    });
+  }
+
+  // Read the taught fields once the right panel is confirmed loaded. No stale-guard needed —
+  // identity is already verified by name, so any present value is THIS listing's.
+  async function grabFields(maxMs) {
     const out = new Array(S.fields.length).fill('');
     const need = new Set(S.fields.map((_, i) => i));
     const deadline = Date.now() + maxMs;
@@ -678,17 +706,15 @@
         const el = queryField(S.fields[i]);
         if (!el) continue;
         const v = valueOf(el);
-        if (v && (el !== prev[i].el || v !== prev[i].val)) { out[i] = v; need.delete(i); }
+        if (v) { out[i] = v; need.delete(i); }
       }
-      if (need.size) await sleep(90);
+      if (need.size) await sleep(80);
     }
     return out;
   }
 
   // live "currently doing" line for the detail pass (separate from the bottom status bar)
   function dlive(msg) { U.detailLive.style.display = 'block'; U.detailLive.textContent = msg; }
-  const rowName = (el) => norm(el.textContent).replace(/·.*$/, '').trim().slice(0, 32) || 'listing';
-
   // per detail field, the set of values that appear in 2+ rows (likely stale grabs)
   function dupSets() {
     const out = new Map();
@@ -731,37 +757,38 @@
       const rowEl = getRowEls().find((e) => rowKey(e) === key);
       const row = S.rows.get(key);
       if (!rowEl || !row) continue;
-      const nm = rowName(rowEl);
+      const nm = listingName(rowEl);
       const pos = `${label} ${done + 1}/${todoKeys.length}`;
       try { rowEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
       hlRow(rowEl);
       const prevUrl = location.href;
-      const prev = S.fields.map((f) => {
-        const el = queryField(f);
-        return { el, val: el ? valueOf(el) : '' };
-      });
-      // click and wait for the panel to switch — RETRY the click up to 3× if it never opens
-      let switched = false, rEl = rowEl;
-      for (let att = 0; att < 3 && !switched && S.detailing; att++) {
+      // click, then wait for THIS listing's panel (title matches the row name) — retry the click up to 3×
+      let ready = false, rEl = rowEl;
+      for (let att = 0; att < 3 && !ready && S.detailing; att++) {
         if (att > 0) {
           rEl = getRowEls().find((e) => rowKey(e) === key) || rEl; // re-find in case the list re-rendered
           try { rEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
         }
-        dlive(att === 0 ? `👆 ${pos}  ${nm} — clicking listing` : `⟳ ${pos}  ${nm} — panel didn't open, re-clicking (try ${att + 1}/3)`);
+        dlive(att === 0 ? `👆 ${pos}  ${nm} — clicking listing` : `⟳ ${pos}  ${nm} — wrong/slow panel, re-clicking (try ${att + 1}/3)`);
         simulateClick(rEl.querySelector('a[href]') || rEl);
-        dlive(`⏳ ${pos}  ${nm} — waiting for panel to open${att ? ` (try ${att + 1})` : ''}`);
-        switched = await waitPanelSwitch(prevUrl, prev, 3500 + att * 1500);
+        dlive(`⏳ ${pos}  ${nm} — waiting for its panel${att ? ` (try ${att + 1})` : ''}`);
+        ready = await waitForPanel(nm, prevUrl, 4000 + att * 2000);
       }
-      await sleep(clickDelay());
-      dlive(`🔎 ${pos}  ${nm} — looking for: ${S.fields.map((f) => f.name).join(', ')}`);
-      const vals = await grabAll(prev, switched ? 1500 : 3000);
+      let vals = new Array(S.fields.length).fill('');
+      if (ready) {
+        dlive(`🔎 ${pos}  ${nm} — reading: ${S.fields.map((f) => f.name).join(', ')}`);
+        vals = await grabFields(1500);
+      }
       for (let i = 0; i < S.fields.length; i++) {
         const fn = S.fields[i].name;
         if (vals[i]) { if (row.details[fn] !== vals[i]) captured++; row.details[fn] = vals[i]; }
         else if (mode !== 'retry') row.details[fn] = ''; // first pass records a blank; retry keeps the old value
         if (!row.details[fn]) missing++;
       }
-      dlive(`✓ ${pos}  ${nm} — ${S.fields.map((f, i) => `${f.name} ${vals[i] ? '✓' : '—'}`).join(' · ')}`);
+      dlive(ready
+        ? `✓ ${pos}  ${nm} — ${S.fields.map((f, i) => `${f.name} ${vals[i] ? '✓' : '—'}`).join(' · ')}`
+        : `✗ ${pos}  ${nm} — panel never loaded (left for retry)`);
+      await sleep(clickDelay()); // pacing between listings (avoids rate-limiting)
       done++;
       U.barFill.style.width = Math.round((done / todoKeys.length) * 100) + '%';
       setStatus(`${label}: ${done}/${todoKeys.length} rows · ${missing} empty`);
@@ -956,13 +983,16 @@
     const inc = orderedCols().filter((e) => !effExcluded(e.col)).length + S.fields.filter((f) => !f.excluded).length;
     const tot = S.cols.size + S.fields.length;
     U.btnCols.textContent = tot ? `☰ Columns (${inc}/${tot})` : '☰ Columns';
-    let needFix = 0;
+    let nEmpty = 0, nDup = 0;
     if (S.fields.length) {
       const dups = dupSets();
-      needFix = [...S.rows.values()].filter((r) => rowNeeds(r, 'retry', dups)).length;
+      for (const r of S.rows.values()) {
+        if (S.fields.some((f) => !r.details[f.name])) nEmpty++;
+        if (S.fields.some((f) => r.details[f.name] && dups.get(f.name).has(r.details[f.name]))) nDup++;
+      }
     }
-    U.btnRetry.textContent = `↻ Retry empties & dups (${needFix})`;
-    U.btnRetry.style.display = !S.detailing && needFix ? '' : 'none';
+    U.btnRetry.textContent = `↻ Retry: ${nEmpty} empty · ${nDup} dup`;
+    U.btnRetry.style.display = !S.detailing && (nEmpty || nDup) ? '' : 'none';
     renderCols();
     renderPreview();
   }
