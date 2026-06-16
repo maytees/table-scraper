@@ -713,6 +713,64 @@
     });
   }
 
+  // One pass over the rows that need work for `mode`. Returns counts. No setup/teardown.
+  async function runPass(mode, label) {
+    const dups = mode === 'retry' ? dupSets() : null;
+    const todoKeys = [];
+    for (const el of getRowEls()) {
+      const k = rowKey(el);
+      const row = S.rows.get(k);
+      if (row && rowNeeds(row, mode, dups)) todoKeys.push(k);
+    }
+    if (!todoKeys.length) return { total: 0, captured: 0 };
+    U.barFill.style.width = '0%';
+
+    let done = 0, captured = 0, missing = 0;
+    for (const key of todoKeys) {
+      if (!S.detailing) break;
+      const rowEl = getRowEls().find((e) => rowKey(e) === key);
+      const row = S.rows.get(key);
+      if (!rowEl || !row) continue;
+      const nm = rowName(rowEl);
+      const pos = `${label} ${done + 1}/${todoKeys.length}`;
+      try { rowEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
+      hlRow(rowEl);
+      const prevUrl = location.href;
+      const prev = S.fields.map((f) => {
+        const el = queryField(f);
+        return { el, val: el ? valueOf(el) : '' };
+      });
+      // click and wait for the panel to switch — RETRY the click up to 3× if it never opens
+      let switched = false, rEl = rowEl;
+      for (let att = 0; att < 3 && !switched && S.detailing; att++) {
+        if (att > 0) {
+          rEl = getRowEls().find((e) => rowKey(e) === key) || rEl; // re-find in case the list re-rendered
+          try { rEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
+        }
+        dlive(att === 0 ? `👆 ${pos}  ${nm} — clicking listing` : `⟳ ${pos}  ${nm} — panel didn't open, re-clicking (try ${att + 1}/3)`);
+        simulateClick(rEl.querySelector('a[href]') || rEl);
+        dlive(`⏳ ${pos}  ${nm} — waiting for panel to open${att ? ` (try ${att + 1})` : ''}`);
+        switched = await waitPanelSwitch(prevUrl, prev, 3500 + att * 1500);
+      }
+      await sleep(clickDelay());
+      dlive(`🔎 ${pos}  ${nm} — looking for: ${S.fields.map((f) => f.name).join(', ')}`);
+      const vals = await grabAll(prev, switched ? 1500 : 3000);
+      for (let i = 0; i < S.fields.length; i++) {
+        const fn = S.fields[i].name;
+        if (vals[i]) { if (row.details[fn] !== vals[i]) captured++; row.details[fn] = vals[i]; }
+        else if (mode !== 'retry') row.details[fn] = ''; // first pass records a blank; retry keeps the old value
+        if (!row.details[fn]) missing++;
+      }
+      dlive(`✓ ${pos}  ${nm} — ${S.fields.map((f, i) => `${f.name} ${vals[i] ? '✓' : '—'}`).join(' · ')}`);
+      done++;
+      U.barFill.style.width = Math.round((done / todoKeys.length) * 100) + '%';
+      setStatus(`${label}: ${done}/${todoKeys.length} rows · ${missing} empty`);
+      renderSoon();
+    }
+    return { total: todoKeys.length, captured };
+  }
+
+  // mode 'all' = full pass then auto-retry empties & duplicates up to 3×; 'retry' = a single manual retry pass.
   async function detailLoop(mode) {
     if (!S.fields.length) { setStatus('Pick a detail field first.'); return; }
     if (!S.rows.size) collect();
@@ -723,76 +781,31 @@
     U.bar.style.display = 'block';
     U.barFill.style.width = '0%';
 
-    // 'retry' -> rows that are empty OR have a duplicated (likely stale) value; otherwise any row missing a value
-    const dups = mode === 'retry' ? dupSets() : null;
-    const todoKeys = [];
-    for (const el of getRowEls()) {
-      const k = rowKey(el);
-      const row = S.rows.get(k);
-      if (row && rowNeeds(row, mode, dups)) todoKeys.push(k);
-    }
-    if (!todoKeys.length) {
-      S.detailing = false;
-      U.btnDetails.textContent = '▶ Click each row & grab';
-      U.btnDetails.classList.remove('danger');
-      U.bar.style.display = 'none';
-      renderAll();
-      setStatus(mode === 'retry' ? 'No empty values left to retry.' : 'Every row already has its values — nothing to do.');
-      return;
+    let captured = 0, ranAny = false;
+    if (mode === 'retry') {
+      const r = await runPass('retry', 'Retry');
+      captured += r.captured; ranAny = r.total > 0;
+    } else {
+      const first = await runPass('all', 'Pass 1');
+      captured += first.captured; ranAny = first.total > 0;
+      // automatically retry empties & duplicates up to 3 times — replaces clicking the button yourself
+      for (let p = 1; p <= 3 && S.detailing; p++) {
+        const r = await runPass('retry', `Auto-retry ${p}/3`);
+        if (!r.total) break; // nothing left to fix
+        captured += r.captured; ranAny = true;
+      }
     }
 
-    let done = 0, captured = 0, missing = 0, skipped = 0;
-    for (const key of todoKeys) {
-      if (!S.detailing) break;
-      const rowEl = getRowEls().find((e) => rowKey(e) === key);
-      const row = S.rows.get(key);
-      if (!rowEl || !row) { skipped++; continue; }
-      const nm = rowName(rowEl);
-      const pos = `${done + 1}/${todoKeys.length}`;
-      try { rowEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
-      hlRow(rowEl);
-      const prevUrl = location.href;
-      const prev = S.fields.map((f) => {
-        const el = queryField(f);
-        return { el, val: el ? valueOf(el) : '' };
-      });
-      // click and wait for the panel to switch — RETRY the click up to 3× if it never opens
-      // (slow Google, a missed click, or the row re-rendered out from under us)
-      let switched = false, rEl = rowEl;
-      for (let att = 0; att < 3 && !switched && S.detailing; att++) {
-        if (att > 0) {
-          rEl = getRowEls().find((e) => rowKey(e) === key) || rEl; // re-find in case the list re-rendered
-          try { rEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
-        }
-        dlive(att === 0 ? `👆 ${pos}  ${nm} — clicking listing` : `⟳ ${pos}  ${nm} — panel didn't open, re-clicking (try ${att + 1}/3)`);
-        simulateClick(rEl.querySelector('a[href]') || rEl);
-        dlive(`⏳ ${pos}  ${nm} — waiting for panel to open${att ? ` (try ${att + 1})` : ''}`);
-        switched = await waitPanelSwitch(prevUrl, prev, 3500 + att * 1500); // give later tries longer
-      }
-      await sleep(clickDelay()); // small settle + politeness pause
-      // switched => trust values fast (≤1.2s for a blank); fallback keeps the stale-guard a bit longer
-      dlive(`🔎 ${pos}  ${nm} — looking for: ${S.fields.map((f) => f.name).join(', ')}`);
-      const vals = await grabAll(prev, switched ? 1500 : 3000);
-      for (let i = 0; i < S.fields.length; i++) {
-        const fn = S.fields[i].name;
-        if (vals[i]) row.details[fn] = vals[i];
-        else if (mode !== 'retry') row.details[fn] = ''; // first pass records a blank; retry keeps the old value
-        if (row.details[fn]) captured++; else missing++;
-      }
-      dlive(`✓ ${pos}  ${nm} — ${S.fields.map((f, i) => `${f.name} ${vals[i] ? '✓' : '—'}`).join(' · ')}`);
-      done++;
-      U.barFill.style.width = Math.round((done / todoKeys.length) * 100) + '%';
-      setStatus(`Details: ${done}/${todoKeys.length} rows · ${captured} captured · ${missing} empty`);
-      renderSoon();
-    }
     hlRow(null);
-    const stopped = done < todoKeys.length;
+    const stopped = !S.detailing;
     S.detailing = false;
     U.btnDetails.textContent = '▶ Click each row & grab';
     U.btnDetails.classList.remove('danger');
-    dlive(`${stopped ? '⏹ stopped' : '✓ finished'} — ${done}/${todoKeys.length} rows · ${captured} captured · ${missing} empty`);
     renderAll();
-    setStatus(`Detail pass ${stopped ? 'stopped' : 'finished'}: ${done}/${todoKeys.length} rows, ${captured} values, ${missing} empty${skipped ? `, ${skipped} rows gone from page` : ''}. Re-running only retries missing ones.`);
+    const empties = [...S.rows.values()].filter((r) => S.fields.some((f) => !r.details[f.name])).length;
+    const tail = mode === 'all' ? ' (incl. up to 3 auto-retries for empties & duplicates)' : '';
+    if (!ranAny) { dlive('✓ nothing to do — every row already has its values'); setStatus('Nothing to do — every row already filled.'); }
+    else { dlive(`${stopped ? '⏹ stopped' : '✓ all done'} — ${captured} values filled${tail} · ${empties} still empty`); setStatus(`Detail ${stopped ? 'stopped' : 'finished'}${tail}. ${empties} rows still empty.`); }
   }
 
   // ---------- preview & CSV ----------
