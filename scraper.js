@@ -844,11 +844,22 @@
         for (const f of S.fields) f.excluded = true;
         renderAll();
       } }),
-      h('button', { class: 'b small', text: 'Auto', title: 'Back to automatic junk-column detection', onclick: () => {
-        for (const { col } of orderedCols()) col.user = undefined;
-        for (const f of S.fields) f.excluded = false;
-        renderAll();
-      } }),
+      (() => {
+        // combined ordered list of every selectable item (table columns then detail fields)
+        const items = [
+          ...orderedCols().map((e) => ({ kind: 'col', ref: e.col })),
+          ...S.fields.map((f) => ({ kind: 'field', ref: f })),
+        ];
+        const setInc = (it, inc) => { if (it.kind === 'col') it.ref.user = !inc; else it.ref.excluded = !inc; };
+        const attrs = { class: 'b small', title: 'Keep only the first two and last two columns' };
+        if (items.length < 4) attrs.disabled = '';
+        attrs.onclick = () => {
+          if (items.length < 4) return;
+          items.forEach((it, i) => setInc(it, i < 2 || i >= items.length - 2));
+          renderAll();
+        };
+        return h('button', { ...attrs, text: 'First 2 + last 2' });
+      })(),
       h('span', { class: 'muted', text: 'ticked = exported' })));
     const list = h('div', { class: 'collist' });
     for (const { path, col } of orderedCols()) {
