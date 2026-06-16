@@ -94,6 +94,7 @@
     .preview { overflow: auto; max-height: 260px; border: 1px solid #2e3440; border-radius: 8px; display: none; }
     table { border-collapse: collapse; font-size: 11px; }
     th, td { border-bottom: 1px solid #2a3038; border-right: 1px solid #2a3038; padding: 3px 6px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; color: #cfd6e4; }
+    td.dup { background: rgba(224, 107, 107, .22); color: #f0b4b4; }
     th { position: sticky; top: 0; background: #22262f; cursor: pointer; color: #9ec1ff; z-index: 1; }
     th.f { color: #6fd08c; }
     th.off { color: #5c6470; text-decoration: line-through; }
@@ -146,7 +147,7 @@
       if (S.scrolling) return;
       detailLoop('all');
     } });
-    U.btnRetry = h('button', { class: 'b', style: 'display:none', text: '↻ Retry empties', onclick: () => {
+    U.btnRetry = h('button', { class: 'b', style: 'display:none', text: '↻ Retry empties & dups', onclick: () => {
       if (S.detailing) { S.detailing = false; return; }
       if (S.scrolling) return;
       detailLoop('retry');
@@ -665,7 +666,10 @@
 
   // Grab all fields together in one poll loop. Returns as soon as every field is found,
   // so a value-less listing waits once (maxMs) instead of 5s PER field.
-  async function grabAll(prev, switched, maxMs) {
+  // STALE-GUARD: only accept a value once the field clearly belongs to the NEW listing —
+  // a new DOM node OR a value different from the previous listing. This stops Google's
+  // slow repaint from handing us the previous listing's phone/website.
+  async function grabAll(prev, maxMs) {
     const out = new Array(S.fields.length).fill('');
     const need = new Set(S.fields.map((_, i) => i));
     const deadline = Date.now() + maxMs;
@@ -674,8 +678,7 @@
         const el = queryField(S.fields[i]);
         if (!el) continue;
         const v = valueOf(el);
-        // panel already switched => any present value is the new listing's; else guard against stale
-        if (v && (switched || el !== prev[i].el || v !== prev[i].val)) { out[i] = v; need.delete(i); }
+        if (v && (el !== prev[i].el || v !== prev[i].val)) { out[i] = v; need.delete(i); }
       }
       if (need.size) await sleep(90);
     }
@@ -685,6 +688,30 @@
   // live "currently doing" line for the detail pass (separate from the bottom status bar)
   function dlive(msg) { U.detailLive.style.display = 'block'; U.detailLive.textContent = msg; }
   const rowName = (el) => norm(el.textContent).replace(/·.*$/, '').trim().slice(0, 32) || 'listing';
+
+  // per detail field, the set of values that appear in 2+ rows (likely stale grabs)
+  function dupSets() {
+    const out = new Map();
+    for (const f of S.fields) {
+      const counts = new Map();
+      for (const row of S.rows.values()) {
+        const v = row.details[f.name];
+        if (v) counts.set(v, (counts.get(v) || 0) + 1);
+      }
+      const set = new Set();
+      for (const [v, c] of counts) if (c > 1) set.add(v);
+      out.set(f.name, set);
+    }
+    return out;
+  }
+  // does a row need a (re)grab? empty, or — in retry mode — a value duplicated elsewhere
+  function rowNeeds(row, mode, dups) {
+    return S.fields.some((f) => {
+      const v = row.details[f.name];
+      if (mode === 'retry') return v === '' || (v && dups.get(f.name).has(v));
+      return !v;
+    });
+  }
 
   async function detailLoop(mode) {
     if (!S.fields.length) { setStatus('Pick a detail field first.'); return; }
@@ -696,12 +723,13 @@
     U.bar.style.display = 'block';
     U.barFill.style.width = '0%';
 
-    // 'retry' -> only rows where a grab came back empty; otherwise any row missing a value
+    // 'retry' -> rows that are empty OR have a duplicated (likely stale) value; otherwise any row missing a value
+    const dups = mode === 'retry' ? dupSets() : null;
     const todoKeys = [];
     for (const el of getRowEls()) {
       const k = rowKey(el);
       const row = S.rows.get(k);
-      if (row && S.fields.some((f) => (mode === 'retry' ? row.details[f.name] === '' : !row.details[f.name]))) todoKeys.push(k);
+      if (row && rowNeeds(row, mode, dups)) todoKeys.push(k);
     }
     if (!todoKeys.length) {
       S.detailing = false;
@@ -736,10 +764,12 @@
       await sleep(clickDelay()); // small settle + politeness pause
       // switched => trust values fast (≤1.2s for a blank); fallback keeps the stale-guard a bit longer
       dlive(`🔎 ${pos}  ${nm} — looking for: ${S.fields.map((f) => f.name).join(', ')}`);
-      const vals = await grabAll(prev, switched, switched ? 1200 : 3000);
+      const vals = await grabAll(prev, switched ? 1500 : 3000);
       for (let i = 0; i < S.fields.length; i++) {
-        row.details[S.fields[i].name] = vals[i];
-        if (vals[i]) captured++; else missing++;
+        const fn = S.fields[i].name;
+        if (vals[i]) row.details[fn] = vals[i];
+        else if (mode !== 'retry') row.details[fn] = ''; // first pass records a blank; retry keeps the old value
+        if (row.details[fn]) captured++; else missing++;
       }
       dlive(`✓ ${pos}  ${nm} — ${S.fields.map((f, i) => `${f.name} ${vals[i] ? '✓' : '—'}`).join(' · ')}`);
       done++;
@@ -783,6 +813,7 @@
       box.appendChild(h('div', { class: 'muted', style: 'padding:8px', text: 'All columns hidden — tick some in ☰ Columns.' }));
       return;
     }
+    const dups = flds.length ? dupSets() : new Map();
     const table = h('table');
     const trh = h('tr');
     for (const e of cols) trh.appendChild(h('th', { title: e.path, text: e.col.name }));
@@ -791,7 +822,11 @@
     for (const row of S.rows.values()) {
       const tr = h('tr');
       for (const e of cols) tr.appendChild(h('td', { title: row.cells[e.path] || '', text: (row.cells[e.path] || '').slice(0, 60) }));
-      for (const f of flds) tr.appendChild(h('td', { text: (row.details[f.name] || '').slice(0, 60) }));
+      for (const f of flds) {
+        const val = row.details[f.name] || '';
+        const isDup = val && dups.get(f.name) && dups.get(f.name).has(val);
+        tr.appendChild(h('td', { class: isDup ? 'dup' : '', title: isDup ? 'duplicate value — likely a stale grab; use Retry empties & dups' : val, text: val.slice(0, 60) }));
+      }
       table.appendChild(tr);
     }
     box.appendChild(table);
@@ -900,11 +935,13 @@
     const inc = orderedCols().filter((e) => !effExcluded(e.col)).length + S.fields.filter((f) => !f.excluded).length;
     const tot = S.cols.size + S.fields.length;
     U.btnCols.textContent = tot ? `☰ Columns (${inc}/${tot})` : '☰ Columns';
-    const empties = S.fields.length
-      ? [...S.rows.values()].filter((r) => S.fields.some((f) => r.details[f.name] === '')).length
-      : 0;
-    U.btnRetry.textContent = `↻ Retry empties (${empties})`;
-    U.btnRetry.style.display = !S.detailing && empties ? '' : 'none';
+    let needFix = 0;
+    if (S.fields.length) {
+      const dups = dupSets();
+      needFix = [...S.rows.values()].filter((r) => rowNeeds(r, 'retry', dups)).length;
+    }
+    U.btnRetry.textContent = `↻ Retry empties & dups (${needFix})`;
+    U.btnRetry.style.display = !S.detailing && needFix ? '' : 'none';
     renderCols();
     renderPreview();
   }
