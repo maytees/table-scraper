@@ -90,6 +90,7 @@
     .fieldrow button { background: none; border: none; color: #d08080; cursor: pointer; font-size: 13px; padding: 0 2px; }
     .bar { height: 6px; background: #242a35; border-radius: 4px; overflow: hidden; display: none; }
     .bar i { display: block; height: 100%; width: 0%; background: #6fd08c; transition: width .2s; }
+    .dlive { margin-top: 8px; padding: 7px 9px; background: #12141a; border: 1px solid #2a3140; border-radius: 8px; font-size: 11.5px; color: #9ec1ff; line-height: 1.4; word-break: break-word; }
     .preview { overflow: auto; max-height: 260px; border: 1px solid #2e3440; border-radius: 8px; display: none; }
     table { border-collapse: collapse; font-size: 11px; }
     th, td { border-bottom: 1px solid #2a3038; border-right: 1px solid #2a3038; padding: 3px 6px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; color: #cfd6e4; }
@@ -153,6 +154,7 @@
     U.cDelay = h('input', { class: 't', type: 'number', value: '250', min: '0', title: 'Pause between listing clicks (ms). Lower = faster. Separate from the scroll delay.' });
     U.barFill = h('i');
     U.bar = h('div', { class: 'bar' }, U.barFill);
+    U.detailLive = h('div', { class: 'dlive', style: 'display:none' });
     U.btnCsv = h('button', { class: 'b primary', text: '⬇ Export CSV', onclick: exportCsv });
     U.btnCopy = h('button', { class: 'b', title: 'Tab-separated — pastes into Google Sheets / Excel as real cells', text: '⧉ Copy table', onclick: copyCsv });
     U.btnCols = h('button', { class: 'b', text: '☰ Columns', onclick: () => { colsOn = !colsOn; renderAll(); } });
@@ -185,7 +187,8 @@
         U.nameForm,
         h('div', { class: 'row' }, U.btnDetails, U.btnRetry,
           h('label', { class: 'muted' }, 'click delay ', U.cDelay, ' ms')),
-        U.bar),
+        U.bar,
+        U.detailLive),
       h('section', {},
         h('div', { class: 'step' }, h('span', { class: 'n', text: '3' }), 'Export'),
         h('div', { class: 'row' }, U.btnCsv, U.btnCopy),
@@ -533,7 +536,9 @@
     const val = valueOf(el);
     pendingField = { selectors };
     U.nameForm.style.display = 'flex';
-    U.fName.value = suggestName(el) || 'phone';
+    // suggest a sensible default by position: 1st = phone, 2nd = website, then more
+    const defaults = ['phone', 'website', 'address', 'email', 'hours', 'rating'];
+    U.fName.value = suggestName(el) || defaults[S.fields.length] || ('field' + (S.fields.length + 1));
     U.fName.focus();
     U.fName.select();
     setStatus(`Captured “${val.slice(0, 45)}”. Name the column, then Save.`);
@@ -677,6 +682,10 @@
     return out;
   }
 
+  // live "currently doing" line for the detail pass (separate from the bottom status bar)
+  function dlive(msg) { U.detailLive.style.display = 'block'; U.detailLive.textContent = msg; }
+  const rowName = (el) => norm(el.textContent).replace(/·.*$/, '').trim().slice(0, 32) || 'listing';
+
   async function detailLoop(mode) {
     if (!S.fields.length) { setStatus('Pick a detail field first.'); return; }
     if (!S.rows.size) collect();
@@ -710,6 +719,8 @@
       const rowEl = getRowEls().find((e) => rowKey(e) === key);
       const row = S.rows.get(key);
       if (!rowEl || !row) { skipped++; continue; }
+      const nm = rowName(rowEl);
+      const pos = `${done + 1}/${todoKeys.length}`;
       try { rowEl.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch { /* ignore */ }
       hlRow(rowEl);
       const prevUrl = location.href;
@@ -717,16 +728,20 @@
         const el = queryField(f);
         return { el, val: el ? valueOf(el) : '' };
       });
+      dlive(`👆 ${pos}  ${nm} — clicking listing`);
       simulateClick(rowEl.querySelector('a[href]') || rowEl);
       // wait for the listing panel to actually switch (URL change) — event-driven, not a fixed sleep
+      dlive(`⏳ ${pos}  ${nm} — waiting for panel to open`);
       const switched = await waitPanelSwitch(prevUrl, prev, 3500);
       await sleep(clickDelay()); // small settle + politeness pause
       // switched => trust values fast (≤1.2s for a blank); fallback keeps the stale-guard a bit longer
+      dlive(`🔎 ${pos}  ${nm} — looking for: ${S.fields.map((f) => f.name).join(', ')}`);
       const vals = await grabAll(prev, switched, switched ? 1200 : 3000);
       for (let i = 0; i < S.fields.length; i++) {
         row.details[S.fields[i].name] = vals[i];
         if (vals[i]) captured++; else missing++;
       }
+      dlive(`✓ ${pos}  ${nm} — ${S.fields.map((f, i) => `${f.name} ${vals[i] ? '✓' : '—'}`).join(' · ')}`);
       done++;
       U.barFill.style.width = Math.round((done / todoKeys.length) * 100) + '%';
       setStatus(`Details: ${done}/${todoKeys.length} rows · ${captured} captured · ${missing} empty`);
@@ -737,6 +752,7 @@
     S.detailing = false;
     U.btnDetails.textContent = '▶ Click each row & grab';
     U.btnDetails.classList.remove('danger');
+    dlive(`${stopped ? '⏹ stopped' : '✓ finished'} — ${done}/${todoKeys.length} rows · ${captured} captured · ${missing} empty`);
     renderAll();
     setStatus(`Detail pass ${stopped ? 'stopped' : 'finished'}: ${done}/${todoKeys.length} rows, ${captured} values, ${missing} empty${skipped ? `, ${skipped} rows gone from page` : ''}. Re-running only retries missing ones.`);
   }
